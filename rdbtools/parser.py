@@ -270,7 +270,9 @@ class RdbParser :
         callback object during the parsing operation.
         """
         with open(filename, "rb") as f:
+            #读取“REDIS”，如果不是该值，则报错
             self.verify_magic_string(f.read(5))
+            #读取数据库的版本号"001--006"
             self.verify_version(f.read(4))
             self._callback.start_rdb()
             
@@ -278,15 +280,24 @@ class RdbParser :
             db_number = 0
             while True :
                 self._expiry = None
+                #读取下一个无符号字符,系统的一些常量使用的都是用无符号的字符表示的
                 data_type = read_unsigned_char(f)
-                
+
+                ####下面的if-else用于获取过期时间，最终获取的过期时间的单位是微秒，如果过期时间是毫秒，则按long类型读取，
+                ####如果过期时间是秒，则按
+                #判断是否是“过期时间（毫秒）”的标识
                 if data_type == REDIS_RDB_OPCODE_EXPIRETIME_MS :
+                    #读取并设置过期时间
                     self._expiry = to_datetime(read_unsigned_long(f) * 1000)
+                    #读取下一个数据类型（无符号字符）
                     data_type = read_unsigned_char(f)
+                #判断是否是“过期时间(秒)”的标识
                 elif data_type == REDIS_RDB_OPCODE_EXPIRETIME :
                     self._expiry = to_datetime(read_unsigned_int(f) * 1000000)
                     data_type = read_unsigned_char(f)
                 
+
+                ####下面的if-else用户获取数据库选择，
                 if data_type == REDIS_RDB_OPCODE_SELECTDB :
                     if not is_first_database :
                         self._callback.end_database(db_number)
@@ -295,12 +306,15 @@ class RdbParser :
                     self._callback.start_database(db_number)
                     continue
                 
+                ####用于判断读取rdb文件是否结束
                 if data_type == REDIS_RDB_OPCODE_EOF :
                     self._callback.end_database(db_number)
                     self._callback.end_rdb()
                     break
 
+                ####判断数据库编号(db_number)是否在类的dbs中
                 if self.matches_filter(db_number) :
+                    #读取key信息，key肯定是字符串
                     self._key = self.read_string(f)
                     if self.matches_filter(db_number, self._key, data_type):
                         self.read_object(f, data_type)
@@ -309,20 +323,39 @@ class RdbParser :
                 else :
                     self.skip_key_and_object(f, data_type)
 
+    ####*****************************
+    ####当读取的字符是db_number时，判断长度：0-63使用1个字节表示， 64-16383使用两个字节表示，16383-2^32-1使用5个直接表示
+    ####*****************************
     def read_length_with_encoding(self, f) :
         length = 0
         is_encoded = False
         bytes = []
+        #读取无符号字符：return struct.unpack('B', f.read(1))[0]
         bytes.append(read_unsigned_char(f))
+        ####bytes[0] & 11000000 >> 6----就是用来获取bytes[0]的前两位，判断这两位的数值，可能是：01, 11, 10, 00
         enc_type = (bytes[0] & 0xC0) >> 6
+        
+        #如果enc_type为 11==3， 则表示剩下的六位是一个特殊字符
+        ####由此处和read_string方法可以看出如果enc_type==3，那么后六位的值只可能是以下4种：00, 01, 10, 11
+        ####00代表：要读取的值为带符号的一个字节
+        ####01代表：要读取的值为带符号的两个字节
+        ####10代表：要读取的值为带符号的四个字节
+        ####11代表：要读取的数据是LZF压缩后的。压缩的格式遵循 compress_lenth origin_lenth str
         if enc_type == REDIS_RDB_ENCVAL :
             is_encoded = True
+            #0x3F的二进制表示为：111111，下面的操作是为了获取后6位
             length = bytes[0] & 0x3F
+        #如果enc_type是 00==0，则表示剩下的六位是具体的长度
         elif enc_type == REDIS_RDB_6BITLEN :
+            #0x3F的二进制表示为：111111，下面的操作是为了获取后6位
             length = bytes[0] & 0x3F
+        #如果enc_type是 01==1， 则表示再读取1个字节，加上前面的6位，一共14位表示具体的长度
         elif enc_type == REDIS_RDB_14BITLEN :
+            #读取流中的下一位
             bytes.append(read_unsigned_char(f))
+            #0x3F的二进制表示为：111111，和bytes[0]进行按位与，获取byte[0]的后6为，左移8位与byte[1]组成一个14位的数值
             length = ((bytes[0]&0x3F)<<8)|bytes[1]
+        #如果enc_type是10==2， 则表示剩下六位废弃，再读取后面的4个字节，作为长度
         else :
             length = ntohl(f)
         return (length, is_encoded)
@@ -330,11 +363,18 @@ class RdbParser :
     def read_length(self, f) :
         return self.read_length_with_encoding(f)[0]
 
+    ####读取rdb文件中的字符串
+    ####字符串分为非压缩和压缩两种存储方式
+    ####非压缩字符串的结构：lenth  val
+    ####压缩字符串的结构：  REDIS_RDB_ENC_LZF  compress_lenth  origin_lenth val
     def read_string(self, f) :
+        #tup是一个包含lenth和is_encoded的元组
         tup = self.read_length_with_encoding(f)
+        #获取长度和是否编码
         length = tup[0]
         is_encoded = tup[1]
         val = None
+        #is_encoded用来表示是否进行了编码处理
         if is_encoded :
             if length == REDIS_RDB_ENC_INT8 :
                 val = read_signed_char(f)
@@ -346,6 +386,7 @@ class RdbParser :
                 clen = self.read_length(f)
                 l = self.read_length(f)
                 val = self.lzf_decompress(f.read(clen), l)
+        #没有进行编码处理的数据，可以直接读取
         else :
             val = f.read(length)
         return val
@@ -353,21 +394,28 @@ class RdbParser :
     # Read an object for the stream
     # f is the redis file 
     # enc_type is the type of object
+    ####读取对象，f是流， enc_type是对象的类型，对象的类型应该是
     def read_object(self, f, enc_type) :
+        #字符串类型
         if enc_type == REDIS_RDB_TYPE_STRING :
             val = self.read_string(f)
             self._callback.set(self._key, val, self._expiry, info={'encoding':'string'})
+        #list类型
         elif enc_type == REDIS_RDB_TYPE_LIST :
             # A redis list is just a sequence of strings
             # We successively read strings from the stream and create a list from it
             # The lists are in order i.e. the first string is the head, 
             # and the last string is the tail of the list
+            ####---------------------LIST的结构-------------------
+            ####| lenth  |  item1  |  item2  |  ...  |  item N  |
+            ####-------------------------------------------------
             length = self.read_length(f)
             self._callback.start_list(self._key, length, self._expiry, info={'encoding':'linkedlist' })
             for count in xrange(0, length) :
                 val = self.read_string(f)
                 self._callback.rpush(self._key, val)
             self._callback.end_list(self._key)
+        #set类型
         elif enc_type == REDIS_RDB_TYPE_SET :
             # A redis list is just a sequence of strings
             # We successively read strings from the stream and create a set from it
@@ -378,6 +426,7 @@ class RdbParser :
                 val = self.read_string(f)
                 self._callback.sadd(self._key, val)
             self._callback.end_set(self._key)
+        #zset类型
         elif enc_type == REDIS_RDB_TYPE_ZSET :
             length = self.read_length(f)
             self._callback.start_sorted_set(self._key, length, self._expiry, info={'encoding':'skiplist'})
@@ -389,6 +438,7 @@ class RdbParser :
                     score = float(score)
                 self._callback.zadd(self._key, score, val)
             self._callback.end_sorted_set(self._key)
+        #hash类型
         elif enc_type == REDIS_RDB_TYPE_HASH :
             length = self.read_length(f)
             self._callback.start_hash(self._key, length, self._expiry, info={'encoding':'hashtable'})
@@ -638,13 +688,17 @@ class RdbParser :
             self._filters['types'] = [str(x) for x in filters['types']]
         else:
             raise Exception('init_filter', 'invalid value for types in filter %s' %filters['types'])
-        
+    ####匹配过滤器--
+    ####要求db_number在类的dbs中，key在类的keys中，data_type在类的types中
+    ####
     def matches_filter(self, db_number, key=None, data_type=None):
+        ##如果存在dbs，并且db_number不存在于dbs中，则返回false
         if self._filters['dbs'] and (not db_number in self._filters['dbs']):
             return False
+        ##如果key不为None，并且keys中不存在key，则返回false
         if key and (not self._filters['keys'].match(str(key))):
             return False
-
+        ##如果data_type不为None，并且types不存在于data_type中，则返回false
         if data_type is not None and (not self.get_logical_type(data_type) in self._filters['types']):
             return False
         return True
@@ -691,6 +745,7 @@ def skip(f, free):
         f.read(free)
 
 def ntohl(f) :
+    #读取流中后面4位
     val = read_unsigned_int(f)
     new_val = 0
     new_val = new_val | ((val & 0x000000ff) << 24)
